@@ -1,0 +1,661 @@
+"""SkillsBench inference script using Harbor with openhands-sdk agent.
+
+This script runs SkillsBench evaluation using Harbor as the harness
+and openhands-sdk as the agent. Results are saved in a format compatible
+with the standard evaluation pipeline.
+
+Usage:
+    uv run skillsbench-infer <llm_config_path> --dataset benchflow/skillsbench
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from benchmarks.skillsbench.config import HARBOR_DEFAULTS, INFER_DEFAULTS
+from benchmarks.utils.evaluation_utils import construct_eval_output_dir
+from benchmarks.utils.harbor import (
+    HarborCredentialMode,
+    check_harbor_installed as _check_harbor_installed,
+    convert_harbor_to_eval_output as _convert_harbor_to_eval_output,
+    get_supported_agent_name as _get_harbor_supported_agent_name,
+    get_supported_task_filter_flag as _get_harbor_supported_task_filter_flag,
+    run_harbor_evaluation as _run_harbor_evaluation,
+)
+from benchmarks.utils.report_costs import generate_cost_report
+from openhands.sdk import LLM, get_logger
+
+
+logger = get_logger(__name__)
+
+# Output filename for results
+OUTPUT_FILENAME = "output.jsonl"
+
+SKILLSBENCH_REPO_URL = "https://github.com/benchflow-ai/skillsbench.git"
+SKILLSBENCH_REPO_BRANCH = "main"
+DATASET_CACHE_DIR = Path(__file__).parent / "data"
+TASKS_CACHE_DIR = DATASET_CACHE_DIR / "tasks"
+TASKS_METADATA_PATH = DATASET_CACHE_DIR / "source.json"
+REGISTRY_DATASET_PREFIX = "benchflow/skillsbench"
+INSTANCE_ID_PREFIX = "benchflow"
+
+# Skills COPY block injected into Dockerfiles when --with-skills is set.
+# RUN mkdir -p lines ensure parent directories exist before COPY.
+SKILLS_COPY_BLOCK = """\
+# Claude Code
+COPY skills /root/.claude/skills
+# Claude Code (Harbor compatibility)
+COPY skills /etc/claude-code/.claude/skills
+# Codex
+COPY skills /root/.codex/skills
+# OpenCode
+COPY skills /root/.opencode/skill
+# Goose
+COPY skills /root/.goose/skills
+# Factory
+COPY skills /root/.factory/skills
+# Portable agents format (Goose, Amp)
+COPY skills /root/.agents/skills
+"""
+
+
+def check_harbor_installed() -> bool:
+    """Check if harbor CLI is installed and available."""
+    return _check_harbor_installed(HARBOR_DEFAULTS["harbor_executable"])
+
+
+def _run_command(cmd: list[str], error_message: str) -> str:
+    """Run a subprocess command and return stdout."""
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"{error_message}: {stderr}")
+    return result.stdout.strip()
+
+
+def _get_supported_task_filter_flag(harbor_exe: str) -> str:
+    """Detect whether Harbor expects --task-name or --include-task-name."""
+    return _get_harbor_supported_task_filter_flag(harbor_exe)
+
+
+def _get_supported_agent_name(harbor_exe: str) -> str:
+    """Detect whether Harbor exposes the OpenHands agent as openhands or openhands-sdk."""
+    return _get_harbor_supported_agent_name(
+        harbor_exe,
+        default_agent_name=HARBOR_DEFAULTS["agent_name"],
+    )
+
+
+def get_skillsbench_main_commit(
+    repo_url: str = SKILLSBENCH_REPO_URL,
+    branch: str = SKILLSBENCH_REPO_BRANCH,
+) -> str:
+    """Resolve the latest commit hash for the upstream SkillsBench branch."""
+    stdout = _run_command(
+        ["git", "ls-remote", repo_url, f"refs/heads/{branch}"],
+        "Failed to resolve SkillsBench upstream commit",
+    )
+    commit_hash, _, ref = stdout.partition("\t")
+    if not commit_hash or ref != f"refs/heads/{branch}":
+        raise RuntimeError(
+            f"Unexpected git ls-remote output for {repo_url} {branch}: {stdout}"
+        )
+    return commit_hash
+
+
+def _load_cached_commit(metadata_path: Path = TASKS_METADATA_PATH) -> str | None:
+    """Load the cached upstream commit hash for the local task snapshot."""
+    if not metadata_path.is_file():
+        return None
+
+    try:
+        with open(metadata_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(
+            "Ignoring unreadable SkillsBench dataset metadata at %s: %s",
+            metadata_path,
+            e,
+        )
+        return None
+
+    commit_hash = metadata.get("commit_hash")
+    return commit_hash if isinstance(commit_hash, str) and commit_hash else None
+
+
+def download_skillsbench_tasks(
+    commit_hash: str,
+    tasks_dir: Path = TASKS_CACHE_DIR,
+    metadata_path: Path = TASKS_METADATA_PATH,
+    repo_url: str = SKILLSBENCH_REPO_URL,
+    branch: str = SKILLSBENCH_REPO_BRANCH,
+) -> None:
+    """Download only the SkillsBench tasks directory for a specific commit."""
+    data_dir = tasks_dir.parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Downloading SkillsBench tasks from %s@%s into %s",
+        repo_url,
+        commit_hash,
+        tasks_dir,
+    )
+
+    with tempfile.TemporaryDirectory(dir=data_dir) as temp_dir:
+        clone_dir = Path(temp_dir) / "skillsbench"
+        _run_command(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                branch,
+                "--filter=blob:none",
+                "--sparse",
+                repo_url,
+                str(clone_dir),
+            ],
+            "Failed to clone SkillsBench repository",
+        )
+        _run_command(
+            ["git", "-C", str(clone_dir), "sparse-checkout", "set", "tasks"],
+            "Failed to sparsely checkout SkillsBench tasks",
+        )
+        checked_out_commit = _run_command(
+            ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
+            "Failed to read cloned SkillsBench commit",
+        )
+        if checked_out_commit != commit_hash:
+            raise RuntimeError(
+                "Cloned SkillsBench commit does not match upstream HEAD: "
+                f"expected {commit_hash}, got {checked_out_commit}"
+            )
+
+        source_tasks_dir = clone_dir / "tasks"
+        if not source_tasks_dir.is_dir():
+            raise RuntimeError(
+                f"SkillsBench clone at {clone_dir} does not contain a tasks/ directory"
+            )
+
+        if tasks_dir.exists():
+            shutil.rmtree(tasks_dir)
+        shutil.copytree(source_tasks_dir, tasks_dir)
+
+    metadata = {
+        "repo_url": repo_url,
+        "branch": branch,
+        "commit_hash": commit_hash,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def ensure_skillsbench_tasks(
+    tasks_dir: Path = TASKS_CACHE_DIR,
+    metadata_path: Path = TASKS_METADATA_PATH,
+    repo_url: str = SKILLSBENCH_REPO_URL,
+    branch: str = SKILLSBENCH_REPO_BRANCH,
+) -> Path:
+    """Ensure a local SkillsBench task snapshot exists and matches upstream HEAD."""
+    cached_commit = _load_cached_commit(metadata_path)
+    has_cached_tasks = tasks_dir.is_dir() and any(tasks_dir.iterdir())
+
+    try:
+        upstream_commit = get_skillsbench_main_commit(repo_url=repo_url, branch=branch)
+    except RuntimeError as e:
+        if has_cached_tasks and cached_commit:
+            logger.warning(
+                "Failed to check SkillsBench upstream HEAD; using cached tasks from "
+                "%s (%s): %s",
+                tasks_dir,
+                cached_commit,
+                e,
+            )
+            return tasks_dir
+        raise
+
+    if has_cached_tasks and cached_commit == upstream_commit:
+        logger.info(
+            "Using cached SkillsBench tasks at %s (commit %s)",
+            tasks_dir,
+            upstream_commit,
+        )
+        return tasks_dir
+
+    if has_cached_tasks:
+        logger.info(
+            "Refreshing SkillsBench tasks in %s from commit %s to %s",
+            tasks_dir,
+            cached_commit or "<unknown>",
+            upstream_commit,
+        )
+    else:
+        logger.info("No cached SkillsBench tasks found at %s; downloading", tasks_dir)
+
+    download_skillsbench_tasks(
+        commit_hash=upstream_commit,
+        tasks_dir=tasks_dir,
+        metadata_path=metadata_path,
+        repo_url=repo_url,
+        branch=branch,
+    )
+    return tasks_dir
+
+
+def resolve_skillsbench_dataset(dataset: str) -> tuple[str, bool]:
+    """Resolve the dataset argument to a synced local SkillsBench snapshot.
+
+    Harbor 0.5.x validates ``--dataset`` values against the registry before
+    starting a job. SkillsBench is not yet published in the public registry, so
+    ``benchflow/skillsbench`` and versioned aliases like
+    ``benchflow/skillsbench@1.0`` must be resolved to the locally synced Harbor
+    task dataset generated by the SkillsBench adapter.
+    """
+    if dataset == REGISTRY_DATASET_PREFIX or dataset.startswith(
+        f"{REGISTRY_DATASET_PREFIX}@"
+    ):
+        local_tasks_dir = ensure_skillsbench_tasks()
+        return str(local_tasks_dir.resolve()), True
+    raise ValueError(
+        "Unsupported SkillsBench dataset source. Use the default synced "
+        "SkillsBench snapshot or a SkillsBench dataset alias matching "
+        "'benchflow/skillsbench@<version>'."
+    )
+
+
+def _normalize_task_filter_value(task_id: str, *, dataset_is_path: bool) -> str:
+    """Normalize task filter values for Harbor's local-path dataset handling."""
+    if dataset_is_path:
+        return task_id.rsplit("/", 1)[-1]
+    return task_id
+
+
+def _canonicalize_instance_id(task_name: str) -> str:
+    """Normalize SkillsBench task names to stable benchflow/<task-name> ids."""
+    if "/" in task_name:
+        return task_name
+    return f"{INSTANCE_ID_PREFIX}/{task_name}"
+
+
+def get_target_dockerfiles(
+    tasks_dir: Path,
+    task_ids: list[str] | None,
+) -> list[Path]:
+    """Return Dockerfile paths for the selected tasks (or all tasks if none specified)."""
+    if task_ids:
+        names = [tid.rsplit("/", 1)[-1] for tid in task_ids]
+        candidates = [tasks_dir / name / "environment" / "Dockerfile" for name in names]
+    else:
+        candidates = list(tasks_dir.glob("*/environment/Dockerfile"))
+
+    found = [p for p in candidates if p.is_file()]
+    missing = [p for p in candidates if not p.is_file()]
+    for p in missing:
+        logger.warning("Dockerfile not found (skipping skills injection): %s", p)
+    return found
+
+
+def inject_skills_into_dockerfiles(
+    dockerfiles: list[Path],
+) -> list[tuple[Path, str]]:
+    """Inject SKILLS_COPY_BLOCK into Dockerfiles that don't already contain it.
+
+    Returns a list of (path, original_content) for every file that was modified,
+    so callers can revert with revert_dockerfiles().
+    """
+    reverts: list[tuple[Path, str]] = []
+    for dockerfile in dockerfiles:
+        original = dockerfile.read_text(encoding="utf-8")
+        if "COPY skills" in original:
+            logger.debug("Skills already present in %s, skipping injection", dockerfile)
+            continue
+
+        # Insert the block after the last WORKDIR directive, or at end of file.
+        lines = original.splitlines(keepends=True)
+        insert_at = len(lines)
+        for i, line in enumerate(lines):
+            if line.strip().upper().startswith("WORKDIR"):
+                insert_at = i + 1
+
+        injected_lines = (
+            lines[:insert_at] + ["\n", SKILLS_COPY_BLOCK] + lines[insert_at:]
+        )
+        dockerfile.write_text("".join(injected_lines), encoding="utf-8")
+        reverts.append((dockerfile, original))
+        logger.info("Injected skills COPY block into %s", dockerfile)
+
+    return reverts
+
+
+def revert_dockerfiles(reverts: list[tuple[Path, str]]) -> None:
+    """Restore Dockerfiles to their original content after skills injection."""
+    for dockerfile, original in reverts:
+        try:
+            dockerfile.write_text(original, encoding="utf-8")
+            logger.info("Reverted %s", dockerfile)
+        except OSError as e:
+            logger.error("Failed to revert %s: %s", dockerfile, e)
+
+
+def run_harbor_evaluation(
+    llm: LLM,
+    dataset: str,
+    *,
+    dataset_is_path: bool,
+    output_dir: str,
+    num_workers: int = 1,
+    task_ids: list[str] | None = None,
+    n_limit: int | None = None,
+) -> Path:
+    """Run harbor evaluation with openhands-sdk agent.
+
+    Args:
+        llm: LLM configuration for the agent.
+        dataset: Synced SkillsBench task snapshot path or Harbor registry id.
+        dataset_is_path: Whether ``dataset`` should be passed via ``--path``.
+        output_dir: Directory to store output files.
+        num_workers: Number of parallel workers.
+        task_ids: Optional list of specific task IDs to run.
+        n_limit: Optional maximum number of dataset tasks to run.
+
+    Returns:
+        Path to the harbor output directory.
+    """
+    harbor_exe = HARBOR_DEFAULTS["harbor_executable"]
+    agent_name = _get_supported_agent_name(harbor_exe)
+    task_filter_flag = _get_supported_task_filter_flag(harbor_exe)
+
+    return _run_harbor_evaluation(
+        llm=llm,
+        dataset=dataset,
+        output_dir=output_dir,
+        harbor_executable=harbor_exe,
+        agent_name=agent_name,
+        dataset_is_path=dataset_is_path,
+        num_workers=num_workers,
+        task_ids=task_ids,
+        n_limit=n_limit,
+        task_filter_flag=task_filter_flag,
+        normalize_task_id=lambda task_id: _normalize_task_filter_value(
+            task_id,
+            dataset_is_path=dataset_is_path,
+        ),
+        credential_mode=HarborCredentialMode.PROCESS_ENV,
+        retry_legacy_task_flag=True,
+        subprocess_run=subprocess.run,
+    )
+
+
+def convert_harbor_to_eval_output(
+    harbor_output_dir: Path,
+    eval_output_path: Path,
+) -> None:
+    """Convert harbor output to evaluation output format.
+
+    Harbor stores trial results in a job directory structured as:
+        harbor_output/TIMESTAMP/TRIAL_NAME/result.json
+
+    Each trial's result.json contains task_name, verifier_result, agent_result,
+    timing info, and exception details.
+
+    Args:
+        harbor_output_dir: Path to harbor output directory.
+        eval_output_path: Path to write the converted output.jsonl.
+    """
+    _convert_harbor_to_eval_output(
+        harbor_output_dir,
+        eval_output_path,
+        canonicalize_instance_id=_canonicalize_instance_id,
+    )
+
+
+def load_task_ids_from_file(filepath: str) -> list[str]:
+    """Load task IDs from a text file (one per line)."""
+    task_ids = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                task_ids.append(line)
+    return task_ids
+
+
+def main() -> None:
+    """Main entry point for skillsbench inference."""
+    parser = argparse.ArgumentParser(
+        description="Run SkillsBench evaluation with openhands-sdk via Harbor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Run full skillsbench evaluation using a local tasks/ snapshot synced from
+    # https://github.com/benchflow-ai/skillsbench main (adapter-generated
+    # Harbor tasks stored under benchmarks/skillsbench/data/tasks)
+    uv run skillsbench-infer .llm_config/claude.json
+
+    # Run specific tasks
+    uv run skillsbench-infer .llm_config/claude.json --select tasks.txt
+
+    # Versioned SkillsBench aliases also resolve to the synced local dataset
+    uv run skillsbench-infer .llm_config/claude.json --dataset benchflow/skillsbench@1.0
+        """,
+    )
+
+    parser.add_argument(
+        "llm_config_path",
+        type=str,
+        help="Path to JSON LLM configuration file",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=INFER_DEFAULTS["dataset"],
+        help=(
+            "SkillsBench dataset source. The default value syncs tasks/ from the "
+            "benchflow-ai/skillsbench main branch. Versioned aliases like "
+            "benchflow/skillsbench@1.0 also resolve to the same local Harbor "
+            "dataset because SkillsBench is not published in the public Harbor "
+            "registry yet."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=INFER_DEFAULTS["output_dir"],
+        help="Base output directory for evaluation results",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=INFER_DEFAULTS["num_workers"],
+        help="Number of parallel workers",
+    )
+    parser.add_argument(
+        "--n-limit",
+        type=int,
+        help="Maximum number of dataset tasks to run after Harbor filtering",
+    )
+    parser.add_argument(
+        "--select",
+        type=str,
+        help="Path to text file containing task IDs to run (one per line)",
+    )
+    parser.add_argument(
+        "--task-id",
+        type=str,
+        action="append",
+        help="Specific task ID to run (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--note",
+        type=str,
+        help="Optional note for the evaluation run",
+    )
+    parser.add_argument(
+        "--skip-harbor",
+        action="store_true",
+        help="Skip running harbor and only convert existing results",
+    )
+    parser.add_argument(
+        "--with-skills",
+        action="store_true",
+        default=False,
+        help=(
+            "Inject agent skill definitions into the selected task Dockerfiles before "
+            "running evaluation. Adds COPY instructions for Claude Code, Codex, "
+            "OpenCode, Goose, Factory, and portable-agents skill directories. "
+            "Dockerfiles are restored to their original state after Harbor completes."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    # Validate LLM config
+    if not os.path.isfile(args.llm_config_path):
+        logger.error(f"LLM config file does not exist: {args.llm_config_path}")
+        sys.exit(1)
+
+    with open(args.llm_config_path) as f:
+        llm_config = f.read()
+    llm = LLM.model_validate_json(llm_config)
+    logger.info(f"Using LLM: {llm.model}")
+
+    # Check harbor installation
+    if not args.skip_harbor and not check_harbor_installed():
+        logger.error(
+            "Harbor CLI is not installed. Please install it:\n"
+            "  pip install harbor\n"
+            "  # or\n"
+            "  uv pip install harbor"
+        )
+        sys.exit(1)
+
+    resolved_dataset = args.dataset
+    dataset_is_path = False
+    dataset_commit_hash: str | None = None
+    if not args.skip_harbor:
+        try:
+            resolved_dataset, dataset_is_path = resolve_skillsbench_dataset(
+                args.dataset
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        if dataset_is_path and args.dataset == INFER_DEFAULTS["dataset"]:
+            dataset_commit_hash = _load_cached_commit()
+
+    # Construct output directory
+    dataset_description = args.dataset.replace("/", "__").replace("@", "-")
+    structured_output_dir = construct_eval_output_dir(
+        base_dir=args.output_dir,
+        dataset_name=dataset_description,
+        model_name=llm.model,
+        max_iterations=100,  # Not directly used but required for path construction
+        eval_note=args.note,
+    )
+
+    logger.info(f"Output directory: {structured_output_dir}")
+    os.makedirs(structured_output_dir, exist_ok=True)
+
+    # Save metadata
+    metadata = {
+        "llm": llm.model_dump_json(),
+        "dataset": args.dataset,
+        "resolved_dataset": resolved_dataset,
+        "dataset_is_path": dataset_is_path,
+        "dataset_commit_hash": dataset_commit_hash,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "harbor_agent": HARBOR_DEFAULTS["agent_name"],
+        "note": args.note,
+        "with_skills": args.with_skills,
+    }
+    metadata_path = Path(structured_output_dir) / "metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    # Collect task IDs if specified
+    task_ids: list[str] | None = None
+    if args.select:
+        loaded_ids = load_task_ids_from_file(args.select)
+        task_ids = loaded_ids
+        logger.info(f"Loaded {len(loaded_ids)} task IDs from {args.select}")
+    elif args.task_id:
+        task_ids = list(args.task_id)
+        logger.info(f"Running {len(task_ids)} specified task IDs")
+
+    output_path = Path(structured_output_dir) / OUTPUT_FILENAME
+
+    if not args.skip_harbor:
+        # Optionally inject skill definitions into task Dockerfiles
+        dockerfile_reverts: list[tuple[Path, str]] = []
+        if args.with_skills and dataset_is_path:
+            target_dockerfiles = get_target_dockerfiles(
+                tasks_dir=Path(resolved_dataset),
+                task_ids=task_ids,
+            )
+            dockerfile_reverts = inject_skills_into_dockerfiles(target_dockerfiles)
+            logger.info(
+                "Injected skills into %d Dockerfile(s)", len(dockerfile_reverts)
+            )
+
+        # Run harbor evaluation
+        try:
+            harbor_output_dir = run_harbor_evaluation(
+                llm=llm,
+                dataset=resolved_dataset,
+                dataset_is_path=dataset_is_path,
+                output_dir=structured_output_dir,
+                num_workers=args.num_workers,
+                task_ids=task_ids,
+                n_limit=args.n_limit,
+            )
+
+            # Convert harbor output to standard format
+            convert_harbor_to_eval_output(
+                harbor_output_dir=harbor_output_dir,
+                eval_output_path=output_path,
+            )
+
+        except Exception as e:
+            logger.error(f"Evaluation failed: {e}")
+            sys.exit(1)
+        finally:
+            if dockerfile_reverts:
+                revert_dockerfiles(dockerfile_reverts)
+                logger.info(
+                    "Reverted %d Dockerfile(s) after evaluation",
+                    len(dockerfile_reverts),
+                )
+    else:
+        # Skip harbor, just convert existing results
+        harbor_output_dir = Path(structured_output_dir) / "harbor_output"
+        if harbor_output_dir.exists():
+            convert_harbor_to_eval_output(
+                harbor_output_dir=harbor_output_dir,
+                eval_output_path=output_path,
+            )
+        else:
+            logger.error(f"No harbor output found at {harbor_output_dir}")
+            sys.exit(1)
+
+    # Generate cost report
+    if output_path.exists():
+        generate_cost_report(str(output_path))
+
+    logger.info("SkillsBench inference completed!")
+    print(json.dumps({"output_json": str(output_path)}))
+
+
+if __name__ == "__main__":
+    main()
