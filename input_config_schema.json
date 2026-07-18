@@ -1,0 +1,64 @@
+{
+  "fields": [
+    {
+      "name": "model",
+      "type": "text",
+      "label": "Model",
+      "description": "Model name (e.g., glm-latest, sonnet-4-5)",
+      "required": true
+    },
+    {
+      "name": "base_url",
+      "type": "text",
+      "label": "Model API Base URL",
+      "description": "OpenAI-compatible endpoint URL",
+      "required": false,
+      "default": "https://grid.ai.juspay.net/v1"
+    },
+    {
+      "name": "num_workers",
+      "type": "number",
+      "label": "Num Workers",
+      "description": "Concurrent inference workers",
+      "required": false,
+      "default": 4,
+      "constraints": { "min": 1, "max": 32 }
+    },
+    {
+      "name": "max_iterations",
+      "type": "number",
+      "label": "Max Iterations",
+      "description": "Max agent steps per instance",
+      "required": false,
+      "default": 100,
+      "constraints": { "min": 10, "max": 500 }
+    },
+    {
+      "name": "eval_timeout",
+      "type": "number",
+      "label": "Eval Timeout",
+      "description": "Timeout in seconds for SWE-bench evaluation",
+      "required": false,
+      "default": 7200,
+      "constraints": { "min": 600, "max": 14400 }
+    },
+    {
+      "name": "task_range",
+      "type": "text",
+      "label": "Instance Range",
+      "description": "Subset of instances to run, e.g. 0-49. Leave empty for all 500",
+      "required": false,
+      "default": "",
+      "pattern": "^[0-9]+-[0-9]+$"
+    },
+    {
+      "name": "resume",
+      "type": "text",
+      "label": "Resume Previous Run",
+      "description": "Resume a previous run, skipping already-completed instances",
+      "required": false,
+      "default": "false",
+      "options": ["true", "false"]
+    }
+  ]
+}

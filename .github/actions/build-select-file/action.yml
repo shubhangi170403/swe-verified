@@ -1,0 +1,50 @@
+name: Build selected instances file
+description: >
+  Convert comma-separated instance IDs into a newline-separated file
+  and export SELECT_FILE / N_LIMIT env vars for downstream build steps.
+  If no instance IDs are provided, the action is a no-op and the caller's
+  pre-existing SELECT_FILE env var (set at workflow level) is left untouched.
+
+inputs:
+  instance-ids:
+    # Note on semantics: an empty input here means "no override provided", so
+    # this action does nothing and the workflow-level SELECT_FILE default
+    # applies. This is distinct from passing `--select ''` to the underlying
+    # Python build script, which explicitly clears the curated default and
+    # builds the full dataset.
+    description: >
+      Comma-separated instance IDs to build. If empty, this action is a no-op
+      and downstream steps fall back to the workflow-level SELECT_FILE default.
+      To build the full dataset (no curated subset), do not rely on this input;
+      instead, override SELECT_FILE at the workflow level or call build_images.py
+      directly with `--select ''`.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Build selected instances file
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -z "${{ inputs.instance-ids }}" ]; then
+          echo "No explicit instance IDs provided; using workflow default SELECT_FILE."
+          exit 0
+        fi
+
+        SELECT_FILE="${RUNNER_TEMP}/selected-instances.txt"
+        echo "Creating selected instances file at ${SELECT_FILE}"
+
+        echo "${{ inputs.instance-ids }}" \
+          | tr ',' '\n' \
+          | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+          | sed '/^$/d' > "${SELECT_FILE}"
+
+        echo "SELECT_FILE=${SELECT_FILE}" >> "$GITHUB_ENV"
+        # Skip n-limit when explicit instance IDs are provided to avoid double filtering
+        echo "N_LIMIT=" >> "$GITHUB_ENV"
+
+        echo "Selected instance IDs:"
+        cat "${SELECT_FILE}"
