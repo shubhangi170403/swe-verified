@@ -488,11 +488,24 @@ def ensure_local_image(
     base_image: str,
     custom_tag: str,
     target: TargetType = "source-minimal",
+    *,
+    pull_agent_image_from_registry: bool = True,
+    pull_base_image_from_registry: bool = False,
+    preserve_base_registry_namespace: bool = False,
+    base_registry_image_package: str | None = None,
 ) -> bool:
     """Build an agent-server image locally if it doesn't already exist.
 
     Returns True if a build occurred, False if the image already existed.
-    Set FORCE_BUILD=1 to skip auto-detection and always rebuild.
+    Set FORCE_BUILD=1 to skip agent-image auto-detection and always rebuild.
+
+    Benchmarks that persist official base images instead of derived agent
+    images can set ``pull_agent_image_from_registry=False`` and
+    ``pull_base_image_from_registry=True``. The resulting agent image is still
+    built and executed locally exactly as before.
+
+    ``base_registry_image_package`` supports the dashboard convention where
+    all per-instance images are tags under one Artifact Registry package.
     """
     from benchmarks.utils.registry_utils import pull_from_registry
 
@@ -501,10 +514,32 @@ def ensure_local_image(
         logger.info(f"Using pre-built image {agent_server_image}")
         return False
 
-    # Try pulling from artifact registry before falling back to local build.
-    if not force_build and pull_from_registry(agent_server_image):
+    # Try pulling the derived agent image before falling back to a local build.
+    if (
+        not force_build
+        and pull_agent_image_from_registry
+        and pull_from_registry(agent_server_image)
+    ):
         logger.info(f"Pulled image from registry: {agent_server_image}")
         return False
+
+    # SWE-bench stores only its canonical per-instance images in Artifact
+    # Registry. Pull and re-tag the official base before constructing the same
+    # temporary OpenHands agent-server derivative used by the existing runner.
+    if pull_base_image_from_registry and not local_image_exists(base_image):
+        pulled_base = pull_from_registry(
+            base_image,
+            flatten_namespace=not preserve_base_registry_namespace,
+            registry_image_package=base_registry_image_package,
+        )
+        if pulled_base:
+            logger.info(f"Pulled base image from registry: {base_image}")
+        else:
+            logger.warning(
+                "Base image %s was not available in Artifact Registry; "
+                "the Docker build will fall back to its original source",
+                base_image,
+            )
 
     if force_build:
         logger.info(f"FORCE_BUILD set, building image from {base_image}...")

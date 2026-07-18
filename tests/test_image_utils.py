@@ -15,6 +15,38 @@ import pytest
 from benchmarks.utils.build_utils import BuildOutput
 
 
+def test_registry_image_can_preserve_official_namespace():
+    from benchmarks.utils.registry_utils import to_registry_image
+
+    source = "docker.io/swebench/sweb.eval.x86_64.django_1776_django-1:latest"
+    registry = "us-central1-docker.pkg.dev/project/evals"
+
+    assert to_registry_image(
+        source,
+        registry,
+        flatten_namespace=False,
+    ) == (
+        "us-central1-docker.pkg.dev/project/evals/"
+        "swebench/sweb.eval.x86_64.django_1776_django-1:latest"
+    )
+
+
+def test_registry_image_can_use_one_package_with_per_instance_tags():
+    from benchmarks.utils.registry_utils import to_registry_image
+
+    source = "docker.io/swebench/sweb.eval.x86_64.django_1776_django-1:latest"
+    registry = "us-central1-docker.pkg.dev/project/evals"
+
+    assert to_registry_image(
+        source,
+        registry,
+        registry_image_package="sweverified-swebench-images",
+    ) == (
+        "us-central1-docker.pkg.dev/project/evals/"
+        "sweverified-swebench-images:sweb.eval.x86_64.django_1776_django-1"
+    )
+
+
 class TestLocalImageExists:
     """Tests for local_image_exists()."""
 
@@ -160,6 +192,7 @@ class TestEnsureLocalImage:
             agent_server_image="server:v1",
             base_image="base:latest",
             custom_tag="mytag",
+            pull_agent_image_from_registry=False,
         )
         assert result is False
         mock_build.assert_not_called()
@@ -178,6 +211,7 @@ class TestEnsureLocalImage:
             agent_server_image="server:v1",
             base_image="base:latest",
             custom_tag="mytag",
+            pull_agent_image_from_registry=False,
         )
         assert result is True
         mock_build.assert_called_once()
@@ -197,6 +231,7 @@ class TestEnsureLocalImage:
                 agent_server_image="server:v1",
                 base_image="base:latest",
                 custom_tag="mytag",
+                pull_agent_image_from_registry=False,
             )
 
     @patch("benchmarks.utils.build_utils.local_image_exists", return_value=False)
@@ -214,6 +249,7 @@ class TestEnsureLocalImage:
                 agent_server_image="server:v1",
                 base_image="base:latest",
                 custom_tag="mytag",
+                pull_agent_image_from_registry=False,
             )
 
     @patch.dict(os.environ, {"FORCE_BUILD": "1"})
@@ -253,10 +289,50 @@ class TestEnsureLocalImage:
             base_image="base:latest",
             custom_tag="mytag",
             target="binary",
+            pull_agent_image_from_registry=False,
         )
         _, kwargs = mock_build.call_args
         assert kwargs["target"] == "binary"
         assert kwargs["push"] is False
+
+    @patch(
+        "benchmarks.utils.registry_utils.pull_from_registry",
+        return_value=True,
+    )
+    @patch(
+        "benchmarks.utils.build_utils.local_image_exists",
+        side_effect=[False, False],
+    )
+    @patch("benchmarks.utils.build_utils.build_image")
+    def test_pulls_official_base_before_local_agent_build(
+        self,
+        mock_build,
+        _mock_exists,
+        mock_pull,
+    ):
+        from benchmarks.utils.build_utils import ensure_local_image
+
+        mock_build.return_value = BuildOutput(
+            base_image="docker.io/swebench/task:latest",
+            tags=["server:v1"],
+            error=None,
+        )
+
+        assert ensure_local_image(
+            agent_server_image="server:v1",
+            base_image="docker.io/swebench/task:latest",
+            custom_tag="task",
+            pull_agent_image_from_registry=False,
+            pull_base_image_from_registry=True,
+            base_registry_image_package="sweverified-swebench-images",
+        )
+
+        mock_pull.assert_called_once_with(
+            "docker.io/swebench/task:latest",
+            flatten_namespace=True,
+            registry_image_package="sweverified-swebench-images",
+        )
+        mock_build.assert_called_once()
 
 
 class TestBuildImageTelemetry:

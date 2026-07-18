@@ -139,6 +139,62 @@ OK patch=NONEMPTY msgs(a/u)=8/3 tool_calls=12 errors(agent/conv)=0/0 end=finish_
 
 File logging (`logs/instance_<id>.log`) is unaffected by this setting.
 
+### Eval-dashboard artifact layout
+
+The dashboard `run.sh` keeps runtime data separated so periodic log syncs do
+not upload Docker workspaces or duplicate conversation archives:
+
+- `logs/<run-id>/scoring/`: upstream SWE-bench test logs and reports.
+- `logs/<run-id>/artifacts/`: compact predictions, score report, metadata, and
+  cost report.
+- `output/<run-id>/openhands_runtime_logs/`: per-instance OpenHands framework
+  logs and captured stdout/stderr, written while the run is in progress.
+- `output/<run-id>/openhands_agent_logs/<instance-id>.jsonl`: model messages,
+  OpenHands tool calls, and tool results, appended as the agent runs. Events
+  larger than 256KB are replaced by metadata instead of syncing huge payloads.
+- `output/<run-id>_results.json`: the small dashboard result payload.
+- `eval_outputs/`: local resume/debug state, including the full OpenHands
+  output and conversation archives; this is intentionally not dashboard-synced.
+
+Docker workspaces stay inside temporary containers and are cleaned up after
+each instance. No repository checkout is stored under `logs/` or `output/`.
+
+### Artifact Registry image layout
+
+SWE-bench Verified has 500 test instances. The seeder mirrors exactly the 500
+official per-instance SWE-bench images into one Artifact Registry package,
+with one tag per instance. It does not upload a second OpenHands image:
+
+```text
+docker.io/swebench/sweb.eval.x86_64.django_1776_django-12345:latest
+  -> us-central1-docker.pkg.dev/xyne-dev-461113/eval-dashboard/
+     sweverified-swebench-images:sweb.eval.x86_64.django_1776_django-12345
+```
+
+The package is `sweverified-swebench-images`; its tags retain the official
+image basename. This is the same package-plus-instance-tags storage style used
+by the dashboard's SWE-Pro and SWE-Atlas registries, with SWE-Verified-specific
+names.
+
+On a 16-vCPU GCE seeding VM, the recommended command is:
+
+```bash
+SEED_PULL_TIMEOUT=1800 SEED_TIMEOUT=1800 \
+  ./scripts/seed_artifact_registry.sh --limit 200 --parallel 8
+```
+
+The limit defaults to 200 even when `--limit` is omitted. Run the command three
+times to seed the next 200, next 200, and final 100 missing images. Existing
+registry tags are skipped, so interrupted or repeated runs resume safely.
+`--limit 0` processes every missing image in one run.
+
+During patch generation, the registry image is pulled and re-tagged to its
+official local name, then OpenHands builds the same temporary agent-server
+derivative it used before. During scoring, a registry-name adapter points the
+unmodified official SWE-bench harness at the corresponding package tag. Agent
+behavior, workspace tools, patch extraction, test execution, and scoring logic
+are unchanged.
+
 ## Workspace Types
 
 Benchmarks support two workspace types for running evaluations:

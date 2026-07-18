@@ -5,12 +5,18 @@ This module provides constant values used in the SWE-Bench evaluation workflow.
 For dataset, model, and worker defaults, see config.py (INFER_DEFAULTS, EVAL_DEFAULTS).
 """
 
+import os
 from typing import Final, Literal
 
 
 # Docker
 DOCKER_IMAGE_PREFIX: Final[str] = "docker.io/swebench/"
 DOCKER_IMAGE_TAG: Final[str] = "latest"
+# One Artifact Registry package with one tag per Verified instance. This is the
+# same storage shape used by the dashboard's SWE-Pro and SWE-Atlas mirrors.
+REGISTRY_IMAGE_PACKAGE: Final[str] = os.getenv(
+    "SWEBENCH_REGISTRY_IMAGE_PACKAGE", "sweverified-swebench-images"
+)
 WRAPPED_REPOS: Final[frozenset[str]] = frozenset(
     {"sphinx-doc"}
 )  # Repos requiring docutils/roman wrapper

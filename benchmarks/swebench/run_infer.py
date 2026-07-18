@@ -276,6 +276,9 @@ class SWEBenchEvaluation(Evaluation):
                 base_image=official_docker_image,
                 custom_tag=custom_tag,
                 target=build_target,
+                pull_agent_image_from_registry=False,
+                pull_base_image_from_registry=True,
+                base_registry_image_package=constants.REGISTRY_IMAGE_PACKAGE,
             )
             if built and wrap_needed:
                 wrapped_result = wrap_image(base_agent_image, push=False)
@@ -451,6 +454,7 @@ class SWEBenchEvaluation(Evaluation):
             run_id=self.metadata.eval_output_dir,
             instance_id=instance.id,
             attempt=self.current_attempt,
+            interaction_log_dir=os.getenv("OPENHANDS_INTERACTION_LOG_DIR"),
         )
 
         conversation = Conversation(

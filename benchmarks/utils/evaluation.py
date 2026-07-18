@@ -939,7 +939,12 @@ class Evaluation(ABC, BaseModel):
         - Returns (instance, output) so the async caller can stream results
         """
         # Set up instance-specific logging + stdout/stderr redirect
-        log_dir = os.path.join(self.metadata.eval_output_dir, "logs")
+        # Dashboard entry points can route useful per-instance logs to a synced
+        # artifact tree without moving bulky evaluation state or changing the
+        # benchmark's normal output layout.
+        log_dir = os.getenv("EVAL_LOG_DIR") or os.path.join(
+            self.metadata.eval_output_dir, "logs"
+        )
 
         from benchmarks.utils.worker_context import instance_context
 

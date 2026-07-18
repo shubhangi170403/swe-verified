@@ -3,6 +3,7 @@
 import json
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from swebench.harness.constants import (
@@ -12,7 +13,7 @@ from swebench.harness.constants import (
     TESTS_TIMEOUT,
 )
 
-from benchmarks.swebench import apptainer_eval
+from benchmarks.swebench import apptainer_eval, eval_infer
 from benchmarks.swebench.eval_infer import convert_to_swebench_format
 from benchmarks.utils.constants import MODEL_NAME_OR_PATH
 
@@ -70,6 +71,54 @@ class TestConvertToSwebenchFormat:
             result = json.loads(f.readline())
 
         assert result["model_name_or_path"] == MODEL_NAME_OR_PATH
+
+
+def test_local_evaluation_uses_consolidated_artifact_registry_package(
+    monkeypatch,
+    tmp_path,
+):
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text("")
+    run_result = SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(eval_infer, "DOCKER_REGISTRY_PULL_ENABLED", True)
+    monkeypatch.setattr(
+        eval_infer,
+        "DOCKER_REGISTRY_URL",
+        "us-central1-docker.pkg.dev/project/evals",
+    )
+    monkeypatch.setattr(
+        eval_infer.constants,
+        "REGISTRY_IMAGE_PACKAGE",
+        "sweverified-swebench-images",
+    )
+    mock_auth = MagicMock()
+    monkeypatch.setattr(eval_infer, "refresh_gcp_auth", mock_auth)
+    mock_run = MagicMock(return_value=run_result)
+    monkeypatch.setattr(eval_infer.subprocess, "run", mock_run)
+
+    eval_infer.run_swebench_evaluation(
+        predictions_file=str(predictions),
+        run_id="test-run",
+        dataset="princeton-nlp/SWE-bench_Verified",
+        workers=2,
+        split="test",
+        modal=False,
+        timeout=300,
+    )
+
+    command = mock_run.call_args.args[0]
+    kwargs = mock_run.call_args.kwargs
+    namespace_index = command.index("--namespace")
+    registry_repository = (
+        "us-central1-docker.pkg.dev/project/evals/sweverified-swebench-images"
+    )
+    assert command[namespace_index + 1] == registry_repository
+    assert kwargs["cwd"] == predictions.parent
+    assert kwargs["env"]["OPENHANDS_SWEBENCH_REGISTRY_REPOSITORY"] == (
+        registry_repository
+    )
+    mock_auth.assert_called_once_with("us-central1-docker.pkg.dev/project/evals")
 
 
 class TestApptainerEvaluation:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -101,15 +102,29 @@ def refresh_gcp_auth(registry_url: str) -> bool:
         return False
 
 
-def to_registry_image(local_image: str, registry_url: str) -> str:
+def to_registry_image(
+    local_image: str,
+    registry_url: str,
+    *,
+    flatten_namespace: bool = True,
+    registry_image_package: str | None = None,
+) -> str:
     """Map a local image reference to its registry-qualified name.
 
-    The convention (matching swe-auto-eval) is:
+    The default convention (matching swe-auto-eval) is:
     1. Strip the original registry prefix (the first path component that
        looks like a hostname, i.e. contains a ``.`` or ``:``).
     2. Replace the first ``/`` in the remaining path with ``-`` so the
        image sits in a flat namespace inside the artifact registry repo.
     3. Prepend ``registry_url/``.
+
+    Set ``flatten_namespace=False`` to preserve the source path after its
+    registry hostname. This remains available for registries whose consumers
+    address the complete source namespace directly.
+
+    Set ``registry_image_package`` to store many source images as tags under
+    one Artifact Registry package. In that mode the source image basename
+    becomes the destination tag and the source tag is intentionally omitted.
 
     Examples::
 
@@ -124,6 +139,20 @@ def to_registry_image(local_image: str, registry_url: str) -> str:
         ...     "us-central1-docker.pkg.dev/proj/repo",
         ... )
         'us-central1-docker.pkg.dev/proj/repo/swebench-sweb.eval.x86_64.foo:latest'
+
+        >>> to_registry_image(
+        ...     "docker.io/swebench/sweb.eval.x86_64.foo:latest",
+        ...     "us-central1-docker.pkg.dev/proj/repo",
+        ...     flatten_namespace=False,
+        ... )
+        'us-central1-docker.pkg.dev/proj/repo/swebench/sweb.eval.x86_64.foo:latest'
+
+        >>> to_registry_image(
+        ...     "docker.io/swebench/sweb.eval.x86_64.foo:latest",
+        ...     "us-central1-docker.pkg.dev/proj/repo",
+        ...     registry_image_package="sweverified-swebench-images",
+        ... )
+        'us-central1-docker.pkg.dev/proj/repo/sweverified-swebench-images:sweb.eval.x86_64.foo'
     """
     # Split off the tag/digest first so we only manipulate the name part.
     tag_sep = "@" if "@" in local_image else ":"
@@ -138,12 +167,23 @@ def to_registry_image(local_image: str, registry_url: str) -> str:
     if parts and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
         parts = parts[1:]
 
-    # Flatten: join remaining parts with '-' for the first separator, keep
-    # the rest as-is. E.g. ["openhands", "eval-agent-server"] -> "openhands-eval-agent-server"
-    if len(parts) > 1:
+    if registry_image_package:
+        image_tag = parts[-1].lower() if parts else name.rsplit("/", 1)[-1].lower()
+        if not re.fullmatch(r"[a-z0-9_][a-z0-9_.-]{0,127}", image_tag):
+            raise ValueError(
+                f"Image basename is not a valid registry tag: {image_tag!r}"
+            )
+        return (
+            f"{registry_url.rstrip('/')}/{registry_image_package.strip('/')}:"
+            f"{image_tag}"
+        )
+
+    # Flatten the first namespace separator for legacy eval images, or preserve
+    # the complete source path for registries consumed directly by upstream.
+    if len(parts) > 1 and flatten_namespace:
         flat_name = parts[0] + "-" + "/".join(parts[1:])
     elif parts:
-        flat_name = parts[0]
+        flat_name = "/".join(parts)
     else:
         flat_name = name
 
@@ -154,7 +194,12 @@ def to_registry_image(local_image: str, registry_url: str) -> str:
     return result
 
 
-def pull_from_registry(local_image: str) -> bool:
+def pull_from_registry(
+    local_image: str,
+    *,
+    flatten_namespace: bool = True,
+    registry_image_package: str | None = None,
+) -> bool:
     """Pull *local_image* from the configured artifact registry.
 
     Returns ``True`` if the image was successfully pulled and re-tagged with
@@ -168,7 +213,12 @@ def pull_from_registry(local_image: str) -> bool:
     if not DOCKER_REGISTRY_PULL_ENABLED:
         return False
 
-    registry_image = to_registry_image(local_image, DOCKER_REGISTRY_URL)
+    registry_image = to_registry_image(
+        local_image,
+        DOCKER_REGISTRY_URL,
+        flatten_namespace=flatten_namespace,
+        registry_image_package=registry_image_package,
+    )
     logger.info(
         "Attempting to pull image from registry: %s",
         registry_image,

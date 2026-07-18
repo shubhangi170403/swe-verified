@@ -1,4 +1,13 @@
 #!/bin/bash
+
+# Re-exec under stdbuf when available so Docker, uv, Python, and the SWE-bench
+# harness flush their output promptly when the dashboard runner redirects this
+# script to a file. macOS does not ship stdbuf, so this remains a no-op there.
+if [ -z "${STDBUF_APPLIED:-}" ] && command -v stdbuf &>/dev/null; then
+    export STDBUF_APPLIED=1
+    exec stdbuf -oL -eL "$0" "$@"
+fi
+
 # SWE-bench Verified — Dashboard run entry point
 # Called by the eval dashboard with --flags from the UI.
 #
@@ -19,6 +28,12 @@ set -e
 # Force line-buffered stdio for Python children so logs appear immediately
 # when stdout is redirected to a file (e.g., by the eval-runner harness).
 export PYTHONUNBUFFERED=1
+
+# Dashboard runs should emit concise progress rather than every agent event.
+# Full interaction streams and per-instance OpenHands stdout/stderr go to
+# output/<run-id>/ so they are available in the dashboard's run artifacts.
+export RICH_LOGGING=0
+export NO_COLOR=1
 
 # ===========================================================================
 # Restore Artifact Registry auth from setup.sh
@@ -161,6 +176,15 @@ done
 if [ -z "$RUN_ID" ]; then echo "ERROR: --run_id or EVAL_RUN_ID positional arg is required"; print_usage; exit 1; fi
 if [ -z "$MODEL" ]; then echo "ERROR: --model is required"; print_usage; exit 1; fi
 
+# The eval-runner periodically syncs repo/logs and repo/output. Keep scoring
+# artifacts in logs/, OpenHands interactions/runtime logs plus the dashboard
+# result in output/, and never place Docker workspaces in either path.
+DASHBOARD_LOG_DIR="./logs/${RUN_ID}"
+DASHBOARD_OUTPUT_DIR="./output/${RUN_ID}"
+export EVAL_LOG_DIR="${DASHBOARD_OUTPUT_DIR}/openhands_runtime_logs"
+export OPENHANDS_INTERACTION_LOG_DIR="${DASHBOARD_OUTPUT_DIR}/openhands_agent_logs"
+mkdir -p "$EVAL_LOG_DIR" "$OPENHANDS_INTERACTION_LOG_DIR"
+
 # --- Broadcast API key to all provider env vars ---
 # Downstream tools check different env vars depending on the provider.
 # Setting all of them ensures the key is available regardless of which
@@ -215,6 +239,7 @@ echo "=== LLM config written to ${LLM_CONFIG} ==="
 # --- Environment ---
 export IMAGE_TAG_PREFIX=43376f1
 export FORCE_BUILD=1
+export SWEBENCH_REGISTRY_IMAGE_PACKAGE="${SWEBENCH_REGISTRY_IMAGE_PACKAGE:-sweverified-swebench-images}"
 
 # --- Derive output dir (matches OpenHands naming) ---
 MODEL_SAFE=$(echo "openai-${MODEL}" | tr '/' '-')
@@ -230,7 +255,11 @@ fi
 
 # --- Resume check ---
 if [ "$RESUME" = "true" ] && [ -d "$OUTPUT_DIR" ]; then
-    COMPLETED=$(find "$OUTPUT_DIR" -name "*.json" -path "*/instances/*" 2>/dev/null | wc -l | tr -d ' ')
+    if [ -f "${OUTPUT_DIR}/output.jsonl" ]; then
+        COMPLETED=$(wc -l < "${OUTPUT_DIR}/output.jsonl" | tr -d ' ')
+    else
+        COMPLETED=0
+    fi
     echo "=== Resuming: found ${COMPLETED} completed instances in ${OUTPUT_DIR} ==="
     echo "=== swebench-infer will automatically skip already-completed instances ==="
 else
@@ -256,11 +285,38 @@ uv run swebench-infer "$LLM_CONFIG" \
 refresh_docker_auth || true
 
 # --- Step 2: Evaluation ---
+# SWE-bench has a fixed relative log path (logs/run_evaluation). For fresh
+# runs, point it at the dashboard-synced scoring directory so test logs appear
+# while scoring is in progress. Existing resume directories are left intact
+# and copied after scoring for backwards compatibility.
+SCORING_LOG_DIR="${DASHBOARD_LOG_DIR}/scoring"
+mkdir -p "$SCORING_LOG_DIR" "${OUTPUT_DIR}/logs"
+if [ ! -e "${OUTPUT_DIR}/logs/run_evaluation" ]; then
+    SCORING_LOG_ABS=$(cd "$SCORING_LOG_DIR" && pwd -P)
+    ln -s "$SCORING_LOG_ABS" "${OUTPUT_DIR}/logs/run_evaluation"
+fi
+
 echo "=== Step 2: Evaluation ==="
 uv run swebench-eval "${OUTPUT_DIR}/output.jsonl" \
     --run-id "$RUN_ID" \
     --timeout "$EVAL_TIMEOUT" \
     --no-modal
+
+# Persist the compact scoring inputs/results and the upstream SWE-bench test
+# logs for dashboard retrieval. Deliberately do not copy output.jsonl or the
+# conversation archives: those contain bulky duplicate agent histories and
+# remain in eval_outputs for local debugging/resume during the job.
+echo "=== Saving dashboard log artifacts ==="
+ARTIFACT_LOG_DIR="${DASHBOARD_LOG_DIR}/artifacts"
+mkdir -p "$ARTIFACT_LOG_DIR"
+for artifact in metadata.json output.swebench.jsonl output.report.json cost_report.jsonl ERROR_LOGS.txt; do
+    if [ -f "${OUTPUT_DIR}/${artifact}" ]; then
+        cp "${OUTPUT_DIR}/${artifact}" "${ARTIFACT_LOG_DIR}/${artifact}"
+    fi
+done
+if [ -d "${OUTPUT_DIR}/logs/run_evaluation" ] && [ ! -L "${OUTPUT_DIR}/logs/run_evaluation" ]; then
+    cp -R "${OUTPUT_DIR}/logs/run_evaluation/." "$SCORING_LOG_DIR/"
+fi
 
 # --- Step 3: Convert results to dashboard format ---
 echo "=== Step 3: Writing dashboard results ==="

@@ -8,9 +8,10 @@ EVAL_AGENT_SERVER_IMAGE = os.getenv(
     "OPENHANDS_EVAL_AGENT_SERVER_IMAGE", "ghcr.io/openhands/eval-agent-server"
 )
 
-# Google Cloud Artifact Registry URL for pulling pre-built eval images.
-# Eval runners pull images from this registry instead of building from Docker
-# Hub base images, avoiding Docker Hub rate limits.
+# Google Cloud Artifact Registry repository for benchmark Docker images.
+# SWE-bench stores its canonical per-instance images here and constructs the
+# OpenHands agent-server derivative locally, avoiding Docker Hub rate limits
+# without changing the agent's DockerWorkspace execution model.
 # NOTE: No http:// or https:// prefix - Docker image names use bare hostnames.
 DOCKER_REGISTRY_URL = os.getenv(
     "DOCKER_REGISTRY_URL",

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import threading
+from pathlib import Path
 from typing import Any, Callable
 
 from benchmarks.utils.console_logging import print_trajectory_line
@@ -47,6 +50,11 @@ def _extract_event_metadata(event: Event) -> dict[str, Any]:
             metadata["exit_code"] = getattr(obs, "exit_code")
         if hasattr(obs, "is_error"):
             metadata["is_error"] = getattr(obs, "is_error")
+        for attr in ("stdout", "stderr", "output", "content"):
+            if hasattr(obs, attr):
+                value = getattr(obs, attr)
+                if value:
+                    metadata[f"{attr}_preview"] = _truncate(str(value), 4000)
 
     # For actions, extract key fields
     if hasattr(event, "action"):
@@ -69,7 +77,11 @@ def _truncate(s: str, max_len: int) -> str:
 
 
 def build_event_persistence_callback(
-    run_id: str, instance_id: str, attempt: int = 1, show_trajectory: bool = True
+    run_id: str,
+    instance_id: str,
+    attempt: int = 1,
+    show_trajectory: bool = True,
+    interaction_log_dir: str | Path | None = None,
 ) -> ConversationCallback:
     """
     Create a callback that logs events for later retrieval.
@@ -84,6 +96,9 @@ def build_event_persistence_callback(
         instance_id: Identifier for the evaluation instance.
         attempt: Attempt number for retries (1-indexed).
         show_trajectory: If True, print trajectory logs to console.
+        interaction_log_dir: Optional directory for a dashboard-friendly,
+            per-instance JSONL event stream. Events up to 256KB are retained
+            in full; larger events retain metadata and useful previews.
 
     Returns:
         A callback function to be passed to Conversation.
@@ -92,6 +107,22 @@ def build_event_persistence_callback(
         instance_id.split("__")[-1][:20] if "__" in instance_id else instance_id[:20]
     )
     tool_call_index = 0
+    interaction_log_path: Path | None = None
+    interaction_log_lock = threading.Lock()
+    if interaction_log_dir is not None:
+        try:
+            log_dir = Path(interaction_log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            safe_instance_id = "".join(
+                char if char.isalnum() or char in "._-" else "_" for char in instance_id
+            )
+            interaction_log_path = log_dir / f"{safe_instance_id}.jsonl"
+        except OSError as exc:
+            logger.warning(
+                "Could not initialize interaction log for %s: %s",
+                instance_id,
+                exc,
+            )
     # if not bool(os.environ.get(CONVERSATION_EVENT_LOGGING_ENV_VAR, True)):
     #     return lambda event: None
     # TODO: Re-enable the above once we have debugged runtime issues
@@ -113,6 +144,17 @@ def build_event_persistence_callback(
             event_size = len(serialized.encode("utf-8"))
 
             if event_size <= MAX_EVENT_SIZE_BYTES:
+                interaction_record = (
+                    '{"instance_id":'
+                    + json.dumps(instance_id)
+                    + ',"attempt":'
+                    + str(attempt)
+                    + ',"event_type":'
+                    + json.dumps(type(event).__name__)
+                    + ',"event":'
+                    + serialized
+                    + "}"
+                )
                 # Small event: log full content
                 logger.info(
                     "conversation_event",
@@ -128,6 +170,18 @@ def build_event_persistence_callback(
             else:
                 # Large event: log metadata only
                 metadata = _extract_event_metadata(event)
+                interaction_record = json.dumps(
+                    {
+                        "instance_id": instance_id,
+                        "attempt": attempt,
+                        "event_type": type(event).__name__,
+                        "event_size": event_size,
+                        "truncated": True,
+                        "metadata": metadata,
+                    },
+                    default=str,
+                    separators=(",", ":"),
+                )
                 logger.info(
                     "conversation_event_metadata",
                     extra={
@@ -139,6 +193,15 @@ def build_event_persistence_callback(
                         **metadata,
                     },
                 )
+
+            if interaction_log_path is not None:
+                # One append per event keeps the file useful even if a worker or
+                # VM is interrupted. A per-instance lock protects callbacks
+                # delivered by SDK child threads.
+                with interaction_log_lock:
+                    with interaction_log_path.open("a", encoding="utf-8") as log_file:
+                        log_file.write(interaction_record + "\n")
+                        log_file.flush()
         except Exception as exc:
             # Best-effort; never block the run
             logger.debug(

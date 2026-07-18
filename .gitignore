@@ -217,3 +217,10 @@ workspace/
 # Evaluation outputs
 eval_outputs/
 builds/
+
+# Eval-dashboard runtime artifacts
+logs/
+output/
+
+# macOS Finder metadata
+.DS_Store

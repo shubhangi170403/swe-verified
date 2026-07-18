@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,9 +23,14 @@ from benchmarks.swebench.apptainer_eval import (
     run_swebench_evaluation_apptainer,
 )
 from benchmarks.swebench.config import EVAL_DEFAULTS
-from benchmarks.utils.constants import MODEL_NAME_OR_PATH
+from benchmarks.utils.constants import (
+    DOCKER_REGISTRY_PULL_ENABLED,
+    DOCKER_REGISTRY_URL,
+    MODEL_NAME_OR_PATH,
+)
 from benchmarks.utils.laminar import LaminarService
 from benchmarks.utils.patch_utils import remove_files_from_patch
+from benchmarks.utils.registry_utils import refresh_gcp_auth
 from benchmarks.utils.report_costs import generate_cost_report
 from openhands.sdk import get_logger
 
@@ -160,8 +166,23 @@ def run_swebench_evaluation(
 
         # Add parameters
         cmd.extend(["--split", split])
+        subprocess_env = os.environ.copy()
         if modal:
             cmd.extend(["--modal", "true"])
+        elif DOCKER_REGISTRY_PULL_ENABLED:
+            # Verified images are stored as per-instance tags under one GAR
+            # package. A narrowly scoped sitecustomize adapter translates the
+            # upstream TestSpec image key to that registry-only reference; the
+            # official harness, patch application, tests, and scoring are
+            # otherwise untouched.
+            registry_repository = (
+                f"{DOCKER_REGISTRY_URL.rstrip('/')}/{constants.REGISTRY_IMAGE_PACKAGE}"
+            )
+            cmd.extend(["--namespace", registry_repository])
+            subprocess_env["OPENHANDS_SWEBENCH_REGISTRY_REPOSITORY"] = (
+                registry_repository
+            )
+            refresh_gcp_auth(DOCKER_REGISTRY_URL)
         cmd.extend(["--timeout", str(timeout)])
 
         logger.info(f"Running command: {' '.join(cmd)}")
@@ -170,7 +191,12 @@ def run_swebench_evaluation(
         print("-" * 80)
 
         # Stream output directly to console, running from predictions file directory
-        result = subprocess.run(cmd, text=True, cwd=predictions_dir)
+        result = subprocess.run(
+            cmd,
+            text=True,
+            cwd=predictions_dir,
+            env=subprocess_env,
+        )
 
         print("-" * 80)
         if result.returncode == 0:
