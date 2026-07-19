@@ -8,11 +8,12 @@ this file at the repo root guarantees the adapters run before swebench is used.
 
 import sys
 
+from benchmarks.utils.swebench_registry_layout import (
+    apply_swebench_registry_layout_patch,
+)
+
 
 print("benchmarks sitecustomize imported", file=sys.stderr, flush=True)
-
-
-from benchmarks.utils.swebench_registry_layout import apply_swebench_registry_layout_patch
 
 try:
     apply_swebench_registry_layout_patch()

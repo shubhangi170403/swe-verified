@@ -39,11 +39,16 @@ export NO_COLOR=1
 # Restore Artifact Registry auth from setup.sh
 # ===========================================================================
 # setup.sh writes gcloud/docker env vars to this file so we inherit auth
-# state across script boundaries (setup → run).
-if [ -f "/var/lib/docker/gcloud-env.sh" ]; then
-    # shellcheck source=/dev/null
-    source /var/lib/docker/gcloud-env.sh || true
-fi
+# state across script boundaries (setup → run). setup.sh prefers
+# /var/lib/docker (COS bare VM) and falls back to $HOME/.gcloud-eval when
+# that is not writable (dashboard runner container).
+for _gcloud_env in "/var/lib/docker/gcloud-env.sh" "$HOME/.gcloud-eval/gcloud-env.sh"; do
+    if [ -f "$_gcloud_env" ]; then
+        # shellcheck source=/dev/null
+        source "$_gcloud_env" || true
+        break
+    fi
+done
 
 # ===========================================================================
 # Artifact Registry credential helpers
@@ -176,14 +181,37 @@ done
 if [ -z "$RUN_ID" ]; then echo "ERROR: --run_id or EVAL_RUN_ID positional arg is required"; print_usage; exit 1; fi
 if [ -z "$MODEL" ]; then echo "ERROR: --model is required"; print_usage; exit 1; fi
 
-# The eval-runner periodically syncs repo/logs and repo/output. Keep scoring
-# artifacts in logs/, OpenHands interactions/runtime logs plus the dashboard
-# result in output/, and never place Docker workspaces in either path.
+# The eval-runner periodically syncs repo/logs and repo/output, and may
+# inject an explicit output dir via EVAL_RUNNER_OUTPUT_DIR (honored when
+# present, mirroring terminal-bench-v2-agentic). Keep scoring artifacts in
+# logs/, OpenHands interactions/runtime logs plus the dashboard result under
+# the output root, and never place Docker workspaces in either path.
+OUTPUT_ROOT="${EVAL_RUNNER_OUTPUT_DIR:-./output}"
 DASHBOARD_LOG_DIR="./logs/${RUN_ID}"
-DASHBOARD_OUTPUT_DIR="./output/${RUN_ID}"
+DASHBOARD_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_ID}"
+RESULTS_FILE="${OUTPUT_ROOT}/${RUN_ID}_results.json"
 export EVAL_LOG_DIR="${DASHBOARD_OUTPUT_DIR}/openhands_runtime_logs"
 export OPENHANDS_INTERACTION_LOG_DIR="${DASHBOARD_OUTPUT_DIR}/openhands_agent_logs"
-mkdir -p "$EVAL_LOG_DIR" "$OPENHANDS_INTERACTION_LOG_DIR"
+mkdir -p "$EVAL_LOG_DIR" "$OPENHANDS_INTERACTION_LOG_DIR" "$OUTPUT_ROOT"
+
+# Always-write guard: if we exit for ANY reason without a results file, drop
+# a zero-metric one so the dashboard reports metrics instead of a silent
+# FAILED with no artifact. Disarmed after the real results are written.
+write_fallback_results() {
+    [ -f "$RESULTS_FILE" ] && return 0
+    local reason="${1:-unknown}"
+    cat > "$RESULTS_FILE" <<JSON
+{
+  "metrics": {
+    "main": { "name": "Total Resolved", "value": 0 },
+    "secondary": { "pass@1": 0, "resolved": 0, "unresolved": 0, "total_tasks": 0 },
+    "additional": { "status": "no-results", "reason": "${reason}" }
+  }
+}
+JSON
+    echo "[run] WARNING: wrote fallback zero-metric results (${reason}) -> ${RESULTS_FILE}"
+}
+trap 'write_fallback_results "interrupted-or-error (exit $?)"' EXIT
 
 # --- Broadcast API key to all provider env vars ---
 # Downstream tools check different env vars depending on the provider.
@@ -237,20 +265,45 @@ fi
 echo "=== LLM config written to ${LLM_CONFIG} ==="
 
 # --- Environment ---
-export IMAGE_TAG_PREFIX=43376f1
+# No IMAGE_TAG_PREFIX override: benchmarks/utils/version.py derives image
+# tags and the eval output dir from the actual SDK submodule SHA, keeping
+# both consistent with whatever `make build` checked out.
 export FORCE_BUILD=1
 export SWEBENCH_REGISTRY_IMAGE_PACKAGE="${SWEBENCH_REGISTRY_IMAGE_PACKAGE:-sweverified-swebench-images}"
 
-# --- Derive output dir (matches OpenHands naming) ---
-MODEL_SAFE=$(echo "openai-${MODEL}" | tr '/' '-')
-OUTPUT_DIR="./eval_outputs/princeton-nlp__SWE-bench_Verified-test/${MODEL_SAFE}_sdk_43376f1_maxiter_${MAX_ITERATIONS}"
+# --- Derive output dir from the harness itself (single source of truth) ---
+# construct_eval_output_dir uses the real SDK submodule short SHA and the raw
+# llm.model string ("openai/<model>", slash intact); querying it here keeps
+# bash and Python from ever drifting apart on the path.
+OUTPUT_DIR=$(MODEL="$MODEL" MAX_ITERATIONS="$MAX_ITERATIONS" uv run python -c "
+import os
+from benchmarks.utils.evaluation_utils import construct_eval_output_dir
+print(construct_eval_output_dir(
+    './eval_outputs',
+    'princeton-nlp__SWE-bench_Verified-test',
+    'openai/' + os.environ['MODEL'],
+    int(os.environ['MAX_ITERATIONS']),
+    None,
+))" | tail -n 1)
+if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
+    echo "ERROR: could not derive evaluation output dir (is 'make build' complete?)"
+    exit 1
+fi
+echo "=== Output dir: ${OUTPUT_DIR} ==="
 
 # --- Build select args for task range ---
 SELECT_ARGS=""
 if [ -n "$TASK_RANGE" ]; then
-    echo "=== Task range: ${TASK_RANGE} ==="
-    # task_range is like "0-49", meaning first 50 instances
-    SELECT_ARGS="--n-limit $(echo "$TASK_RANGE" | cut -d'-' -f2)"
+    RANGE_START=$(echo "$TASK_RANGE" | cut -d'-' -f1)
+    RANGE_END=$(echo "$TASK_RANGE" | cut -d'-' -f2)
+    # --n-limit runs the FIRST N instances and the range is inclusive, so
+    # 0-49 means 50 instances. Ranges not starting at 0 cannot be expressed.
+    if [ "$RANGE_START" != "0" ]; then
+        echo "WARNING: task ranges must start at 0 (--n-limit is first-N only); running 0-${RANGE_END} instead of ${TASK_RANGE}"
+    fi
+    N_LIMIT=$((RANGE_END + 1))
+    echo "=== Task range: ${TASK_RANGE} -> first ${N_LIMIT} instances ==="
+    SELECT_ARGS="--n-limit ${N_LIMIT}"
 fi
 
 # --- Resume check ---
@@ -319,32 +372,58 @@ if [ -d "${OUTPUT_DIR}/logs/run_evaluation" ] && [ ! -L "${OUTPUT_DIR}/logs/run_
 fi
 
 # --- Step 3: Convert results to dashboard format ---
+# Canonical dashboard shape (same as swe-auto-eval generate_results_json and
+# terminal-bench-v2-agentic): metrics.main / metrics.secondary (flat scalars,
+# rendered as columns) / metrics.additional (nested detail).
 echo "=== Step 3: Writing dashboard results ==="
-mkdir -p output
-python3 -c "
-import json, sys
+OUTPUT_DIR="$OUTPUT_DIR" RESULTS_FILE="$RESULTS_FILE" python3 <<'PYEOF'
+import json
+import os
 
-with open('${OUTPUT_DIR}/output.report.json') as f:
+output_dir = os.environ["OUTPUT_DIR"]
+results_file = os.environ["RESULTS_FILE"]
+
+with open(os.path.join(output_dir, "output.report.json")) as f:
     report = json.load(f)
 
-resolved = report.get('resolved_instances', 0)
-total = report.get('completed_instances', 0) or report.get('total_instances', 500)
-unresolved = report.get('unresolved_instances', 0)
-pass_at_1 = resolved / total if total > 0 else 0
+resolved = report.get("resolved_instances", 0)
+completed = report.get("completed_instances", 0)
+total = completed or report.get("total_instances", 500)
+unresolved = report.get("unresolved_instances", 0)
+errors = report.get("error_instances", 0)
+empty_patches = report.get("empty_patch_instances", 0)
+pass_at_1 = round(resolved / total, 4) if total > 0 else 0
 
 results = {
-    'total_resolved': resolved,
-    'pass@1': round(pass_at_1, 4),
-    'resolved': resolved,
-    'unresolved': unresolved,
-    'total_tasks': total
+    "metrics": {
+        "main": {"name": "Total Resolved", "value": resolved},
+        "secondary": {
+            "pass@1": pass_at_1,
+            "resolved": resolved,
+            "unresolved": unresolved,
+            "total_tasks": total,
+        },
+        "additional": {
+            "pass@1": {
+                "generated": completed,
+                "resolved": resolved,
+                "unresolved": unresolved,
+                "errors": errors,
+                "empty_patches": empty_patches,
+            }
+        },
+    }
 }
 
-out_path = 'output/${RUN_ID}_results.json'
-with open(out_path, 'w') as f:
+tmp = results_file + ".tmp"
+with open(tmp, "w") as f:
     json.dump(results, f, indent=2)
-print(f'Results written to {out_path}')
+os.replace(tmp, results_file)
+print(f"Results written to {results_file}")
 print(json.dumps(results, indent=2))
-"
+PYEOF
+
+# Real results written — disarm the fallback guard.
+trap - EXIT
 
 echo "=== Done! ==="

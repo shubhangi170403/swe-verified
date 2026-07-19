@@ -1,6 +1,8 @@
 from swebench.harness.test_spec.test_spec import TestSpec
 
-from benchmarks.utils.swebench_registry_layout import apply_swebench_registry_layout_patch
+from benchmarks.utils.swebench_registry_layout import (
+    apply_swebench_registry_layout_patch,
+)
 
 
 def test_registry_layout_patch_uses_one_package_and_instance_tag(monkeypatch) -> None:
