@@ -8,6 +8,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from benchmarks.swebench import constants
 from benchmarks.swebench.apptainer_build import ensure_apptainer_agent_image
+from benchmarks.swebench.build_base_images import dockerfile_content_hash
 from benchmarks.swebench.build_images import (
     extract_custom_tag,
     get_official_docker_image,
@@ -261,12 +262,16 @@ class SWEBenchEvaluation(Evaluation):
 
         official_docker_image = self.get_official_docker_image(instance)
         build_target = constants.DEFAULT_BUILD_TARGET
-        custom_tag = self.extract_custom_tag(official_docker_image)
+        instance_tag = self.extract_custom_tag(official_docker_image)
+        # Include Dockerfile content hash so the SDK build produces tags
+        # that match the phased image tag prefix ({sdk_sha}-{content_hash}-...).
+        content_hash = dockerfile_content_hash()
+        custom_tag = f"{content_hash}-{instance_tag}"
         # For non-binary targets, append target suffix
         suffix = (
             f"-{build_target}" if build_target != constants.BUILD_TARGET_BINARY else ""
         )
-        base_agent_image = f"{EVAL_AGENT_SERVER_IMAGE}:{get_phased_image_tag_prefix()}-{custom_tag}{suffix}"
+        base_agent_image = f"{EVAL_AGENT_SERVER_IMAGE}:{get_phased_image_tag_prefix()}-{instance_tag}{suffix}"
         wrap_needed = self.should_wrap_instance(instance)
         agent_server_image = base_agent_image
 
@@ -329,7 +334,7 @@ class SWEBenchEvaluation(Evaluation):
                 )
                 local_agent_image = ensure_apptainer_agent_image(
                     base_image=official_docker_image,
-                    custom_tag=custom_tag,
+                    custom_tag=instance_tag,
                     target=build_target,
                     wrap_swebench_deps=wrap_needed,
                 )
@@ -348,7 +353,7 @@ class SWEBenchEvaluation(Evaluation):
                     "RUNTIME_API_KEY environment variable is not set for remote workspace"
                 )
 
-            agent_server_image = f"{EVAL_AGENT_SERVER_IMAGE}:{get_phased_image_tag_prefix()}-{custom_tag}{suffix}"
+            agent_server_image = f"{EVAL_AGENT_SERVER_IMAGE}:{get_phased_image_tag_prefix()}-{instance_tag}{suffix}"
             if not remote_image_exists(agent_server_image):
                 raise RuntimeError(
                     f"Agent server image {agent_server_image} does not exist in container registry, "

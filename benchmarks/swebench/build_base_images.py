@@ -56,14 +56,18 @@ AGENT_LAYER_DOCKERFILE = (
 
 
 def _get_repo_root() -> Path:
-    """Get the repository root using git."""
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return Path(result.stdout.strip())
+    """Get the repository root using git, with a filesystem fallback."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return Path(result.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback: build_base_images.py lives at <repo>/benchmarks/swebench/
+        return Path(__file__).resolve().parents[2]
 
 
 def _get_sdk_dockerfile() -> Path:
