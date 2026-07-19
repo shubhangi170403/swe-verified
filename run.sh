@@ -345,6 +345,7 @@ SWEV_DOOD_HOST_FIX="$DOOD_GATE" uv run swebench-infer "$LLM_CONFIG" \
     --workspace docker \
     --num-workers "$NUM_WORKERS" \
     --output-dir "${PWD}/eval_outputs" \
+    --n-critic-runs 3 \
     $SELECT_ARGS
 
 # --- Refresh credentials before evaluation (tokens may have expired during inference) ---
