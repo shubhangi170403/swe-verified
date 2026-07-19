@@ -389,8 +389,13 @@ fi
 # Canonical dashboard shape (same as swe-auto-eval generate_results_json and
 # terminal-bench-v2-agentic): metrics.main / metrics.secondary (flat scalars,
 # rendered as columns) / metrics.additional (nested detail).
+# The report alone under-counts: aggregate_results drops instances whose final
+# attempt errored (iterative.py "if entry.error: continue"), so they never
+# reach the SWE-bench harness. The attempt files still contain every attempted
+# instance, so totals are reconciled against them.
 echo "=== Step 3: Writing dashboard results ==="
 OUTPUT_DIR="$OUTPUT_DIR" RESULTS_FILE="$RESULTS_FILE" python3 <<'PYEOF'
+import glob
 import json
 import os
 
@@ -402,11 +407,62 @@ with open(os.path.join(output_dir, "output.report.json")) as f:
 
 resolved = report.get("resolved_instances", 0)
 completed = report.get("completed_instances", 0)
-total = completed or report.get("total_instances", 500)
 unresolved = report.get("unresolved_instances", 0)
 errors = report.get("error_instances", 0)
-empty_patches = report.get("empty_patch_instances", 0)
+
+# Every attempted instance has a row in output.critic_attempt_*.jsonl, even
+# ones whose final attempt errored; output.jsonl holds only the error-free
+# rows that were submitted for evaluation. Lines embed full agent history
+# (can be MBs), so stream one at a time and keep only the needed fields.
+attempted_ids = set()
+for attempt_file in glob.glob(
+    os.path.join(output_dir, "output.critic_attempt_*.jsonl")
+):
+    with open(attempt_file) as f:
+        for line in f:
+            try:
+                instance_id = json.loads(line).get("instance_id")
+            except ValueError:
+                continue
+            if instance_id:
+                attempted_ids.add(instance_id)
+
+submitted_ids = set()
+generated = 0
+try:
+    with open(os.path.join(output_dir, "output.jsonl")) as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            instance_id = data.get("instance_id")
+            if not instance_id:
+                continue
+            submitted_ids.add(instance_id)
+            if (data.get("test_result") or {}).get("git_patch"):
+                generated += 1
+except OSError:
+    pass
+
+if attempted_ids:
+    total = len(attempted_ids)
+    infer_errors = len(attempted_ids - submitted_ids)
+else:
+    # No attempt files (unexpected layout) - fall back to report-only totals.
+    total = completed or report.get("total_instances", 500)
+    infer_errors = 0
+    generated = completed
+
+empty_patches = max(total - generated, 0)
 pass_at_1 = round(resolved / total, 4) if total > 0 else 0
+
+if infer_errors:
+    print(
+        f"WARNING: {infer_errors} of {total} attempted instances were dropped "
+        "from output.jsonl due to inference errors and never reached the "
+        "SWE-bench harness (see output.critic_attempt_*.jsonl for details)."
+    )
 
 results = {
     "metrics": {
@@ -414,16 +470,18 @@ results = {
         "secondary": {
             "pass@1": pass_at_1,
             "resolved": resolved,
-            "unresolved": unresolved,
+            "unresolved": total - resolved,
             "total_tasks": total,
         },
         "additional": {
             "pass@1": {
-                "generated": completed,
+                "generated": generated,
                 "resolved": resolved,
                 "unresolved": unresolved,
                 "errors": errors,
                 "empty_patches": empty_patches,
+                "infer_errors": infer_errors,
+                "submitted": len(submitted_ids) or completed,
             }
         },
     }
