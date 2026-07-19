@@ -251,6 +251,54 @@ if ! make build; then
     exit 1
 fi
 
+# --- DooD host-fix patch (agent-server health checks) ---
+# On the Batch runner (DooD) DockerWorkspace health-checks 127.0.0.1:<port>,
+# which lives in the COS host's netns, not ours — every instance fails with
+# "Container failed to become healthy in time" (proven on run 739ac5ae).
+# Install scripts/swev_dood_hostfix.py + a .pth loader into the project venv;
+# the patch is inert unless run.sh exports SWEV_DOOD_HOST_FIX=1.
+install_dood_hostfix() {
+    echo "[setup] Installing DooD host-fix patch into project venv..."
+    local sp
+    sp=$(uv run python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])" 2>/dev/null | tail -n 1)
+    if [ -z "$sp" ] || [ ! -d "$sp" ]; then
+        echo "[setup] WARNING: could not locate venv site-packages; DooD host fix NOT installed"
+        return 1
+    fi
+    cp scripts/swev_dood_hostfix.py "$sp/swev_dood_hostfix.py" || {
+        echo "[setup] WARNING: failed to copy patch module"; return 1; }
+    printf 'import swev_dood_hostfix\n' > "$sp/swev_dood_hostfix.pth" || {
+        echo "[setup] WARNING: failed to write .pth loader"; return 1; }
+
+    # Self-verify both gate states (mirrors the terminal-bench .pth pattern).
+    if ! uv run python -c "
+from openhands.workspace.docker.workspace import DockerWorkspace as W
+assert not getattr(W._wait_for_health, '_swev_dood', False), 'patched with gate OFF'
+print('[setup] DooD host-fix gate-off: unpatched (correct)')"; then
+        echo "[setup] WARNING: DooD host-fix gate-off verification failed"
+        return 1
+    fi
+    if ! SWEV_DOOD_HOST_FIX=1 uv run python -c "
+from openhands.workspace.docker.workspace import DockerWorkspace as W
+assert getattr(W._wait_for_health, '_swev_dood', False), 'gate ON but not patched'
+print('[setup] DooD host-fix gate-on: patched (correct)')"; then
+        echo "[setup] WARNING: DooD host-fix gate-on verification failed"
+        return 1
+    fi
+    echo "[setup] DooD host-fix installed and verified."
+}
+
+if ! install_dood_hostfix; then
+    # Without the patch, a DooD run deterministically fails at the first
+    # health check — surface that at setup time instead of 20 minutes in.
+    if [ -S /var/run/docker.sock ] && [ -f /.dockerenv ]; then
+        echo "[setup] ERROR: DooD environment detected but the host-fix patch could not be installed."
+        echo "[setup]        Agent health checks WILL fail (run 739ac5ae failure mode). Aborting."
+        exit 1
+    fi
+    echo "[setup] WARNING: DooD host-fix unavailable (harmless on native VMs)."
+fi
+
 # --- Verification summary (warn-only) ---
 echo "[setup] Verification:"
 for tool in git docker python3 uv; do

@@ -274,12 +274,14 @@ export SWEBENCH_REGISTRY_IMAGE_PACKAGE="${SWEBENCH_REGISTRY_IMAGE_PACKAGE:-sweve
 # --- Derive output dir from the harness itself (single source of truth) ---
 # construct_eval_output_dir uses the real SDK submodule short SHA and the raw
 # llm.model string ("openai/<model>", slash intact); querying it here keeps
-# bash and Python from ever drifting apart on the path.
+# bash and Python from ever drifting apart on the path. The base is absolute
+# so result writes keep working even if a build step changes the process cwd
+# mid-run (observed on run 4cbf23b5: ENOENT on relative ./eval_outputs paths).
 OUTPUT_DIR=$(MODEL="$MODEL" MAX_ITERATIONS="$MAX_ITERATIONS" uv run python -c "
 import os
 from benchmarks.utils.evaluation_utils import construct_eval_output_dir
 print(construct_eval_output_dir(
-    './eval_outputs',
+    os.path.join(os.getcwd(), 'eval_outputs'),
     'princeton-nlp__SWE-bench_Verified-test',
     'openai/' + os.environ['MODEL'],
     int(os.environ['MAX_ITERATIONS']),
@@ -290,6 +292,16 @@ if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
     exit 1
 fi
 echo "=== Output dir: ${OUTPUT_DIR} ==="
+
+# --- DooD detection: gate the agent-server host fix ---
+# The .pth patch installed by setup.sh activates only when this is "1", and
+# only the inference step needs it (DockerWorkspace lives there). Native VM
+# runs keep SDK behavior byte-identical.
+DOOD_GATE=0
+if [ -S /var/run/docker.sock ] && { [ -f /.dockerenv ] || [ -n "${EVAL_RUNNER_WORK_DIR:-}" ]; }; then
+    DOOD_GATE=1
+    echo "=== DooD environment detected: agent-server host fix ENABLED ==="
+fi
 
 # --- Build select args for task range ---
 SELECT_ARGS=""
@@ -326,12 +338,13 @@ ensure_docker_running || true
 
 # --- Step 1: Inference ---
 echo "=== Step 1: Inference (model=${MODEL}, workers=${NUM_WORKERS}) ==="
-uv run swebench-infer "$LLM_CONFIG" \
+SWEV_DOOD_HOST_FIX="$DOOD_GATE" uv run swebench-infer "$LLM_CONFIG" \
     --dataset princeton-nlp/SWE-bench_Verified \
     --split test \
     --max-iterations "$MAX_ITERATIONS" \
     --workspace docker \
     --num-workers "$NUM_WORKERS" \
+    --output-dir "${PWD}/eval_outputs" \
     $SELECT_ARGS
 
 # --- Refresh credentials before evaluation (tokens may have expired during inference) ---
