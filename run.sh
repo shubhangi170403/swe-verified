@@ -104,76 +104,79 @@ ensure_docker_running() {
 }
 
 # ===========================================================================
-# Per-instance Docker image reaper
+# Docker image reaper
 # ===========================================================================
 # Every SWE-bench instance pulls its own multi-GB base image (two tags: the
 # registry tag and a docker.io/swebench re-tag) and builds a per-instance
 # agent-server image on top. Nothing downstream ever deletes them, which
 # filled the 200 GB Batch VM disk ~66 instances into a full 500-instance run
-# (run 0bf4b460: ENOSPC after 3h10m). The reaper deletes an instance's images
-# only once its conversation archive exists — written after the attempt fully
-# finishes, so its container (started with --rm) is already gone — keeping
-# disk usage bounded near workers x image size.
+# (run 0bf4b460: ENOSPC after 3h10m).
 #
-# Guards against racing a critic re-run of the same instance:
-#   - skip while any container (running or exited) references the image
-#   - skip agent-server images younger than REAPER_MIN_AGE_SECONDS (a fresh
-#     rebuild whose container has not started yet)
-#   - base tags are removed only together with a qualifying agent-server
-#     image, so a freshly re-pulled base for an in-flight rebuild is never
-#     deleted on its own
+# The sweep is REPOSITORY-based, never per-instance-key: the SDK build tags
+# each agent-server image THREE times, and one variant truncates the instance
+# id and appends a random hex ("...django-1143_tag_latest-f83ac7d09257-...").
+# Instance-key matching misses that tag, which then pins the whole 5 GB image
+# chain forever — a live 500-instance run (8481cf66) leaked ~100 GB exactly
+# this way before a manual sweep saved it.
+#
+# Guards, per image:
+#   - skip while any container (running or exited) references it
+#   - agent-server images: skip if built < REAPER_MIN_AGE_SECONDS ago
+#     (a fresh build whose container has not started yet)
+#   - base images: skip if TAGGED locally < REAPER_MIN_AGE_SECONDS ago
+#     (Metadata.LastTagTime = pull/re-tag time; .Created is the months-old
+#     upstream build date, useless as a local-freshness signal). This
+#     protects a just-pulled base whose build has not produced tags yet.
+#   - bases still pinned by an agent-server image fail rmi harmlessly and
+#     are retried next pass once the child images are gone.
 # Worst-case miss: a critic re-run re-pulls/rebuilds its images (minutes);
 # verdicts are unaffected (scoring uses only the patch + Step 2's own images).
 REAPER_INTERVAL_SECONDS=180
 REAPER_MIN_AGE_SECONDS=1800
 REAPER_PID=""
 
-# $1 = instance_id, $2 = newline-separated repo:tag list for this instance
-reap_instance_images() {
-    local instance_id="$1"
-    local matches="$2"
-    local agent_image=""
-    local img
-    while IFS= read -r img; do
-        case "$img" in *eval-agent-server*) agent_image="$img" ;; esac
-    done <<< "$matches"
-    # Base tags may only go together with a qualifying agent-server image.
-    [ -n "$agent_image" ] || return 0
-    if [ -n "$(docker ps -aq --filter "ancestor=${agent_image}" 2>/dev/null)" ]; then
-        return 0
+# $1 = repo:tag, $2 = inspect format for the local-freshness timestamp
+image_reaper_eligible() {
+    local img="$1"
+    local time_format="$2"
+    local stamp epoch now
+    if [ -n "$(docker ps -aq --filter "ancestor=${img}" 2>/dev/null)" ]; then
+        return 1
     fi
-    local created created_epoch now
-    created=$(docker image inspect -f '{{.Created}}' "$agent_image" 2>/dev/null) || return 0
-    created_epoch=$(date -d "$created" +%s 2>/dev/null) || return 0
+    stamp=$(docker image inspect -f "$time_format" "$img" 2>/dev/null) || return 1
+    # Trim sub-second precision (and any trailing zone text after it) so GNU
+    # date parses both Go formats: "2026-07-20T09:31:50.75Z" and
+    # "2026-07-20 09:31:50.75 +0000 UTC". Both are UTC, and the trim drops
+    # the zone marker — parse with -u or a non-UTC host skews every age.
+    epoch=$(date -u -d "${stamp%%.*}" +%s 2>/dev/null) || return 1
     now=$(date +%s)
-    if [ $((now - created_epoch)) -lt "$REAPER_MIN_AGE_SECONDS" ]; then
-        return 0
-    fi
-    echo "[reaper] removing images for ${instance_id}"
-    # Child (agent-server) first so the base tags become deletable.
-    docker rmi "$agent_image" >/dev/null 2>&1 || true
-    while IFS= read -r img; do
-        [ "$img" = "$agent_image" ] && continue
-        docker rmi "$img" >/dev/null 2>&1 || true
-    done <<< "$matches"
+    [ $((now - epoch)) -ge "$REAPER_MIN_AGE_SECONDS" ]
 }
 
 image_reaper_pass() {
-    # One docker-images snapshot per pass; per-instance docker calls happen
-    # only for instances that still have images present.
-    local all_images
-    all_images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-        | grep -E 'sweb\.eval\.|eval-agent-server' || true)
-    [ -n "$all_images" ] || return 0
-    local archive instance_id image_key matches
-    for archive in "${OUTPUT_DIR}/conversations/"*.tar.gz; do
-        [ -e "$archive" ] || continue
-        instance_id=$(basename "$archive" .tar.gz)
-        image_key="sweb.eval.x86_64.${instance_id//__/_1776_}"
-        matches=$(printf '%s\n' "$all_images" | grep -F "$image_key" || true)
-        [ -n "$matches" ] || continue
-        reap_instance_images "$instance_id" "$matches"
-    done
+    local img err removed=0
+    # Agent-server images first (children of the bases) — every tag shape.
+    while IFS= read -r img; do
+        image_reaper_eligible "$img" '{{.Created}}' || continue
+        if err=$(docker rmi "$img" 2>&1 >/dev/null); then
+            removed=$((removed + 1))
+        else
+            echo "[reaper] rmi failed ${img}: $(printf '%s' "$err" | head -1)"
+        fi
+    done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | grep -F 'eval-agent-server' || true)
+    # Base images (registry tag + docker.io/swebench re-tag). Pinned ones
+    # fail quietly; they free up next pass after their children are gone.
+    while IFS= read -r img; do
+        image_reaper_eligible "$img" '{{.Metadata.LastTagTime}}' || continue
+        docker rmi "$img" >/dev/null 2>&1 && removed=$((removed + 1))
+    done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | grep -E 'sweb\.eval|sweverified-swebench-images' \
+        | grep -vF 'eval-agent-server' || true)
+    if [ "$removed" -gt 0 ]; then
+        echo "[reaper] pass removed ${removed} image tag(s)"
+    fi
+    docker image prune -f >/dev/null 2>&1 || true
 }
 
 image_reaper_loop() {
