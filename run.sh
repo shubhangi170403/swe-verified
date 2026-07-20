@@ -177,6 +177,14 @@ image_reaper_pass() {
         echo "[reaper] pass removed ${removed} image tag(s)"
     fi
     docker image prune -f >/dev/null 2>&1 || true
+    # FORCE_BUILD=1 rebuilds the agent-server image per instance; each build
+    # leaves BuildKit cache that `docker rmi`/`image prune` NEVER touch, so it
+    # grows unbounded (154GB observed on a 500-run). Only `builder prune` frees
+    # it. Plain `-f` (no --keep-storage: that flag is deprecated/version-gated
+    # and would silently no-op on rejection). Inactive cache only — the daemon
+    # protects active/in-progress builds; between-attempt rebuilds cost ~3min,
+    # the same trade-off already accepted for reaped images above.
+    docker builder prune -f >/dev/null 2>&1 || true
 }
 
 image_reaper_loop() {
