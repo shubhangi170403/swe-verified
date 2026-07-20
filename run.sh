@@ -104,6 +104,133 @@ ensure_docker_running() {
 }
 
 # ===========================================================================
+# Per-instance Docker image reaper
+# ===========================================================================
+# Every SWE-bench instance pulls its own multi-GB base image (two tags: the
+# registry tag and a docker.io/swebench re-tag) and builds a per-instance
+# agent-server image on top. Nothing downstream ever deletes them, which
+# filled the 200 GB Batch VM disk ~66 instances into a full 500-instance run
+# (run 0bf4b460: ENOSPC after 3h10m). The reaper deletes an instance's images
+# only once its conversation archive exists — written after the attempt fully
+# finishes, so its container (started with --rm) is already gone — keeping
+# disk usage bounded near workers x image size.
+#
+# Guards against racing a critic re-run of the same instance:
+#   - skip while any container (running or exited) references the image
+#   - skip agent-server images younger than REAPER_MIN_AGE_SECONDS (a fresh
+#     rebuild whose container has not started yet)
+#   - base tags are removed only together with a qualifying agent-server
+#     image, so a freshly re-pulled base for an in-flight rebuild is never
+#     deleted on its own
+# Worst-case miss: a critic re-run re-pulls/rebuilds its images (minutes);
+# verdicts are unaffected (scoring uses only the patch + Step 2's own images).
+REAPER_INTERVAL_SECONDS=180
+REAPER_MIN_AGE_SECONDS=1800
+REAPER_PID=""
+
+# $1 = instance_id, $2 = newline-separated repo:tag list for this instance
+reap_instance_images() {
+    local instance_id="$1"
+    local matches="$2"
+    local agent_image=""
+    local img
+    while IFS= read -r img; do
+        case "$img" in *eval-agent-server*) agent_image="$img" ;; esac
+    done <<< "$matches"
+    # Base tags may only go together with a qualifying agent-server image.
+    [ -n "$agent_image" ] || return 0
+    if [ -n "$(docker ps -aq --filter "ancestor=${agent_image}" 2>/dev/null)" ]; then
+        return 0
+    fi
+    local created created_epoch now
+    created=$(docker image inspect -f '{{.Created}}' "$agent_image" 2>/dev/null) || return 0
+    created_epoch=$(date -d "$created" +%s 2>/dev/null) || return 0
+    now=$(date +%s)
+    if [ $((now - created_epoch)) -lt "$REAPER_MIN_AGE_SECONDS" ]; then
+        return 0
+    fi
+    echo "[reaper] removing images for ${instance_id}"
+    # Child (agent-server) first so the base tags become deletable.
+    docker rmi "$agent_image" >/dev/null 2>&1 || true
+    while IFS= read -r img; do
+        [ "$img" = "$agent_image" ] && continue
+        docker rmi "$img" >/dev/null 2>&1 || true
+    done <<< "$matches"
+}
+
+image_reaper_pass() {
+    # One docker-images snapshot per pass; per-instance docker calls happen
+    # only for instances that still have images present.
+    local all_images
+    all_images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | grep -E 'sweb\.eval\.|eval-agent-server' || true)
+    [ -n "$all_images" ] || return 0
+    local archive instance_id image_key matches
+    for archive in "${OUTPUT_DIR}/conversations/"*.tar.gz; do
+        [ -e "$archive" ] || continue
+        instance_id=$(basename "$archive" .tar.gz)
+        image_key="sweb.eval.x86_64.${instance_id//__/_1776_}"
+        matches=$(printf '%s\n' "$all_images" | grep -F "$image_key" || true)
+        [ -n "$matches" ] || continue
+        reap_instance_images "$instance_id" "$matches"
+    done
+}
+
+image_reaper_loop() {
+    set +e
+    local pass=0
+    while true; do
+        sleep "$REAPER_INTERVAL_SECONDS"
+        pass=$((pass + 1))
+        image_reaper_pass
+        # Disk observability roughly every 15 minutes.
+        if [ $((pass % 5)) -eq 1 ]; then
+            echo "[reaper] runner disk: $(df -h . 2>/dev/null | tail -1)"
+            docker system df 2>/dev/null | sed 's/^/[reaper] /' || true
+        fi
+    done
+}
+
+start_image_reaper() {
+    command -v docker >/dev/null 2>&1 || return 0
+    image_reaper_loop &
+    REAPER_PID=$!
+    echo "[reaper] started (pid=${REAPER_PID}, interval=${REAPER_INTERVAL_SECONDS}s, min-age=${REAPER_MIN_AGE_SECONDS}s)"
+}
+
+stop_image_reaper() {
+    if [ -n "$REAPER_PID" ]; then
+        kill "$REAPER_PID" 2>/dev/null || true
+        wait "$REAPER_PID" 2>/dev/null || true
+        REAPER_PID=""
+        echo "[reaper] stopped"
+    fi
+}
+
+# Bulk-remove all remaining per-instance images after Step 1 so Step 2's
+# evaluation pulls start with a clean disk. No age guard needed: inference is
+# over, only in-use images (none expected) are skipped.
+cleanup_step1_images() {
+    command -v docker >/dev/null 2>&1 || return 0
+    echo "[reaper] final cleanup: removing remaining per-instance images"
+    local pattern img
+    # Children (agent-server) first so base tags become deletable.
+    for pattern in 'eval-agent-server' 'sweb\.eval\.'; do
+        docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+            | grep -E "$pattern" \
+            | while IFS= read -r img; do
+                if [ -z "$(docker ps -aq --filter "ancestor=${img}" 2>/dev/null)" ]; then
+                    docker rmi "$img" >/dev/null 2>&1 || true
+                fi
+            done
+    done
+    docker image prune -f >/dev/null 2>&1 || true
+    docker builder prune -f >/dev/null 2>&1 || true
+    echo "[reaper] post-cleanup runner disk: $(df -h . 2>/dev/null | tail -1)"
+    docker system df 2>/dev/null | sed 's/^/[reaper] /' || true
+}
+
+# ===========================================================================
 # Argument Parsing
 # ===========================================================================
 print_usage() {
@@ -211,7 +338,12 @@ write_fallback_results() {
 JSON
     echo "[run] WARNING: wrote fallback zero-metric results (${reason}) -> ${RESULTS_FILE}"
 }
-trap 'write_fallback_results "interrupted-or-error (exit $?)"' EXIT
+on_exit_fallback() {
+    local rc=$?
+    stop_image_reaper
+    write_fallback_results "interrupted-or-error (exit ${rc})"
+}
+trap on_exit_fallback EXIT
 
 # --- Broadcast API key to all provider env vars ---
 # Downstream tools check different env vars depending on the provider.
@@ -337,6 +469,7 @@ fi
 ensure_docker_running || true
 
 # --- Step 1: Inference ---
+start_image_reaper
 echo "=== Step 1: Inference (model=${MODEL}, workers=${NUM_WORKERS}) ==="
 SWEV_DOOD_HOST_FIX="$DOOD_GATE" uv run swebench-infer "$LLM_CONFIG" \
     --dataset princeton-nlp/SWE-bench_Verified \
@@ -347,6 +480,11 @@ SWEV_DOOD_HOST_FIX="$DOOD_GATE" uv run swebench-infer "$LLM_CONFIG" \
     --output-dir "${PWD}/eval_outputs" \
     --n-critic-runs 3 \
     $SELECT_ARGS
+
+# Inference done — stop the reaper and clear all remaining per-instance
+# images so Step 2's evaluation pulls have a clean disk.
+stop_image_reaper
+cleanup_step1_images
 
 # --- Refresh credentials before evaluation (tokens may have expired during inference) ---
 refresh_docker_auth || true
