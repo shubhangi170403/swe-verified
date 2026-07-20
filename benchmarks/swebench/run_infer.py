@@ -180,6 +180,21 @@ class SWEBenchEvaluation(Evaluation):
             instance.id,
             len(git_patch),
         )
+
+        # Save failure patch immediately so it survives pod crashes
+        patch_dir = os.getenv("EVAL_LOG_DIR") or os.getenv(
+            "OPENHANDS_INTERACTION_LOG_DIR"
+        )
+        if patch_dir and git_patch:
+            try:
+                patch_path = os.path.join(patch_dir, f"{instance.id}.patch")
+                with open(patch_path, "w") as pf:
+                    pf.write(git_patch)
+            except Exception as e:
+                logger.warning(
+                    "Failed to save failure patch for %s: %s", instance.id, e
+                )
+
         return {
             "git_patch": git_patch,
             "git_patch_captured_on_error": True,
@@ -507,6 +522,18 @@ class SWEBenchEvaluation(Evaluation):
 
         # Get git patch
         git_patch = self.get_git_patch(instance, workspace)
+
+        # Save patch immediately so it survives pod crashes
+        patch_dir = os.getenv("EVAL_LOG_DIR") or os.getenv(
+            "OPENHANDS_INTERACTION_LOG_DIR"
+        )
+        if patch_dir and git_patch:
+            try:
+                patch_path = os.path.join(patch_dir, f"{instance.id}.patch")
+                with open(patch_path, "w") as pf:
+                    pf.write(git_patch)
+            except Exception as e:
+                logger.warning("Failed to save patch for %s: %s", instance.id, e)
 
         # Log instance summary
         summarize_instance(
